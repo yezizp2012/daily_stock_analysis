@@ -236,8 +236,16 @@ class StockAnalysisPipeline:
             context = self.db.get_analysis_context(code)
             
             if context is None:
-                logger.warning(f"[{code}] 无法获取分析上下文，跳过分析")
-                return None
+                logger.warning(f"[{code}] 无法获取历史行情数据，将仅基于新闻和实时行情分析")
+                from datetime import date
+                context = {
+                    'code': code,
+                    'stock_name': stock_name,
+                    'date': date.today().isoformat(),
+                    'data_missing': True,
+                    'today': {},
+                    'yesterday': {}
+                }
             
             # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
             enhanced_context = self._enhance_context(
@@ -599,6 +607,12 @@ class StockAnalysisPipeline:
                         non_wechat_success = self.notifier.send_to_email(report) or non_wechat_success
                     elif channel == NotificationChannel.CUSTOM:
                         non_wechat_success = self.notifier.send_to_custom(report) or non_wechat_success
+                    elif channel == NotificationChannel.PUSHPLUS:
+                        non_wechat_success = self.notifier.send_to_pushplus(report) or non_wechat_success
+                    elif channel == NotificationChannel.DISCORD:
+                        non_wechat_success = self.notifier.send_to_discord(report) or non_wechat_success
+                    elif channel == NotificationChannel.PUSHOVER:
+                        non_wechat_success = self.notifier.send_to_pushover(report) or non_wechat_success
                     else:
                         logger.warning(f"未知通知渠道: {channel}")
 
