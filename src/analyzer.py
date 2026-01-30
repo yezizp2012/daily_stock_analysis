@@ -87,6 +87,66 @@ STOCK_NAME_MAP = {
 }
 
 
+def get_stock_name_multi_source(
+    stock_code: str, 
+    context: Optional[Dict] = None,
+    data_manager = None
+) -> str:
+    """
+    多来源获取股票中文名称
+    
+    获取策略（按优先级）：
+    1. 从传入的 context 中获取（realtime 数据）
+    2. 从静态映射表 STOCK_NAME_MAP 获取
+    3. 从 DataFetcherManager 获取（各数据源）
+    4. 返回默认名称（股票+代码）
+    
+    Args:
+        stock_code: 股票代码
+        context: 分析上下文（可选）
+        data_manager: DataFetcherManager 实例（可选）
+        
+    Returns:
+        股票中文名称
+    """
+    # 1. 从上下文获取（实时行情数据）
+    if context:
+        # 优先从 stock_name 字段获取
+        if context.get('stock_name'):
+            name = context['stock_name']
+            if name and not name.startswith('股票'):
+                return name
+        
+        # 其次从 realtime 数据获取
+        if 'realtime' in context and context['realtime'].get('name'):
+            return context['realtime']['name']
+    
+    # 2. 从静态映射表获取
+    if stock_code in STOCK_NAME_MAP:
+        return STOCK_NAME_MAP[stock_code]
+    
+    # 3. 从数据源获取
+    if data_manager is None:
+        try:
+            from data_provider.base import DataFetcherManager
+            data_manager = DataFetcherManager()
+        except Exception as e:
+            logger.debug(f"无法初始化 DataFetcherManager: {e}")
+    
+    if data_manager:
+        try:
+            name = data_manager.get_stock_name(stock_code)
+            if name:
+                # 更新缓存
+                STOCK_NAME_MAP[stock_code] = name
+                return name
+        except Exception as e:
+            logger.debug(f"从数据源获取股票名称失败: {e}")
+    
+    # 4. 返回默认名称
+    return f'股票{stock_code}'
+
+
 @dataclass
 class AnalysisResult:
     """
@@ -134,7 +194,6 @@ class AnalysisResult:
     buy_reason: str = ""  # 买入/卖出理由
     
     # ========== 元数据 ==========
-    market_snapshot: Optional[Dict[str, Any]] = None  # 当日行情快照（展示用）
     raw_response: Optional[str] = None  # 原始响应（调试用）
     search_performed: bool = False  # 是否执行了联网搜索
     data_sources: str = ""  # 数据来源说明
@@ -168,7 +227,6 @@ class AnalysisResult:
             'key_points': self.key_points,
             'risk_warning': self.risk_warning,
             'buy_reason': self.buy_reason,
-            'market_snapshot': self.market_snapshot,
             'search_performed': self.search_performed,
             'success': self.success,
             'error_message': self.error_message,
@@ -600,23 +658,6 @@ class GeminiAnalyzer:
         config = get_config()
         max_retries = config.gemini_max_retries
         base_delay = config.gemini_retry_delay
-
-        def _build_request_kwargs(max_tokens: Optional[int]) -> dict:
-            kwargs = {
-                "model": self._current_model_name,
-                "messages": [
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": generation_config.get('temperature', config.openai_temperature),
-            }
-            if max_tokens is not None:
-                kwargs["max_tokens"] = max_tokens
-            return kwargs
-
-        def _is_unsupported_param_error(error_message: str, param_name: str) -> bool:
-            lower_msg = error_message.lower()
-            return ("unsupported parameter" in lower_msg or "unsupported param" in lower_msg) and param_name in lower_msg
         
         for attempt in range(max_retries):
             try:
@@ -627,31 +668,15 @@ class GeminiAnalyzer:
                     time.sleep(delay)
                 
                 config = get_config()
-                max_output_tokens = generation_config.get('max_output_tokens', 8192)
-                try:
-                    response = self._openai_client.chat.completions.create(
-                        **_build_request_kwargs(max_output_tokens)
-                    )
-                except Exception as e:
-                    error_str = str(e)
-                    if _is_unsupported_param_error(error_str, "max_tokens"):
-                        try:
-                            response = self._openai_client.chat.completions.create(
-                                **{**_build_request_kwargs(None), "max_completion_tokens": max_output_tokens}
-                            )
-                        except Exception as e2:
-                            error_str_2 = str(e2)
-                            if (
-                                _is_unsupported_param_error(error_str_2, "max_completion_tokens")
-                                or _is_unsupported_param_error(error_str_2, "max_tokens")
-                            ):
-                                response = self._openai_client.chat.completions.create(
-                                    **_build_request_kwargs(None)
-                                )
-                            else:
-                                raise
-                    else:
-                        raise
+                response = self._openai_client.chat.completions.create(
+                    model=self._current_model_name,
+                    messages=[
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=generation_config.get('temperature', config.openai_temperature),
+                    max_tokens=generation_config.get('max_output_tokens', 8192),
+                )
                 
                 if response and response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content
@@ -847,35 +872,27 @@ class GeminiAnalyzer:
                 "max_output_tokens": 8192,
             }
 
-            provider_label = "OpenAI" if self._use_openai else "Gemini"
-            logger.info(
-                f"[LLM调用] 开始调用 {provider_label} API (model={model_name}, "
-                f"temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})..."
-            )
+            # 根据实际使用的 API 显示日志
+            api_provider = "OpenAI" if self._use_openai else "Gemini"
+            logger.info(f"[LLM调用] 开始调用 {api_provider} API...")
             
             # 使用带重试的 API 调用
             start_time = time.time()
             response_text = self._call_api_with_retry(prompt, generation_config)
             elapsed = time.time() - start_time
-            
+
             # 记录响应信息
-            logger.info(
-                f"[LLM返回] {provider_label} API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符"
-            )
+            logger.info(f"[LLM返回] {api_provider} API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符")
             
             # 记录响应预览（INFO级别）和完整响应（DEBUG级别）
             response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
             logger.info(f"[LLM返回 预览]\n{response_preview}")
-            logger.debug(
-                f"=== {provider_label} 完整响应 ({len(response_text)}字符) ===\n"
-                f"{response_text}\n=== End Response ==="
-            )
+            logger.debug(f"=== {api_provider} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ===")
             
             # 解析响应
             result = self._parse_response(response_text, code, name)
             result.raw_response = response_text
             result.search_performed = bool(news_context)
-            result.market_snapshot = self._build_market_snapshot(context)
             
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
             
@@ -1098,72 +1115,6 @@ class GeminiAnalyzer:
             return f"{amount / 1e4:.2f} 万元"
         else:
             return f"{amount:.0f} 元"
-
-    def _format_percent(self, value: Optional[float]) -> str:
-        """格式化百分比显示"""
-        if value is None:
-            return 'N/A'
-        try:
-            return f"{float(value):.2f}%"
-        except (TypeError, ValueError):
-            return 'N/A'
-
-    def _format_price(self, value: Optional[float]) -> str:
-        """格式化价格显示"""
-        if value is None:
-            return 'N/A'
-        try:
-            return f"{float(value):.2f}"
-        except (TypeError, ValueError):
-            return 'N/A'
-
-    def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """构建当日行情快照（展示用）"""
-        today = context.get('today', {}) or {}
-        realtime = context.get('realtime', {}) or {}
-        yesterday = context.get('yesterday', {}) or {}
-
-        prev_close = yesterday.get('close')
-        close = today.get('close')
-        high = today.get('high')
-        low = today.get('low')
-
-        amplitude = None
-        change_amount = None
-        if prev_close not in (None, 0) and high is not None and low is not None:
-            try:
-                amplitude = (float(high) - float(low)) / float(prev_close) * 100
-            except (TypeError, ValueError, ZeroDivisionError):
-                amplitude = None
-        if prev_close is not None and close is not None:
-            try:
-                change_amount = float(close) - float(prev_close)
-            except (TypeError, ValueError):
-                change_amount = None
-
-        snapshot = {
-            "date": context.get('date', '未知'),
-            "close": self._format_price(close),
-            "open": self._format_price(today.get('open')),
-            "high": self._format_price(high),
-            "low": self._format_price(low),
-            "prev_close": self._format_price(prev_close),
-            "pct_chg": self._format_percent(today.get('pct_chg')),
-            "change_amount": self._format_price(change_amount),
-            "amplitude": self._format_percent(amplitude),
-            "volume": self._format_volume(today.get('volume')),
-            "amount": self._format_amount(today.get('amount')),
-        }
-
-        if realtime:
-            snapshot.update({
-                "price": self._format_price(realtime.get('price')),
-                "volume_ratio": realtime.get('volume_ratio', 'N/A'),
-                "turnover_rate": self._format_percent(realtime.get('turnover_rate')),
-                "source": getattr(realtime.get('source'), 'value', realtime.get('source', 'N/A')),
-            })
-
-        return snapshot
     
     def _parse_response(
         self, 
