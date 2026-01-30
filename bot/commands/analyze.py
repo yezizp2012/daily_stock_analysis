@@ -49,7 +49,7 @@ class AnalyzeCommand(BotCommand):
         if not args:
             return "请输入股票代码"
         
-        code = args[0].lower()
+        code = args[0].upper()
 
         # 验证股票代码格式
         # A股：6位数字
